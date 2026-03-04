@@ -127,8 +127,18 @@ def get_multiplier(product):
 def norm(name):
     return str(name).lower().split(":")[0].strip()
 
+def detect_header_row(uploaded_file):
+    """Find the row containing 'Product/Service' to use as header."""
+    raw = pd.read_excel(uploaded_file, header=None)
+    for i, row in raw.iterrows():
+        if any("product" in str(v).lower() for v in row.values):
+            return i
+    return 3  # fallback
+
 def process_file(uploaded_file, template_bytes):
-    df = pd.read_excel(uploaded_file, header=3)
+    header_row = detect_header_row(uploaded_file)
+    uploaded_file.seek(0)
+    df = pd.read_excel(uploaded_file, header=header_row)
     df.columns = ["Product", "Trans_Date", "Num", "ABCA", "Customer", "Memo", "Quantity"]
     df = df[df["Product"] != "TOTAL"].dropna(subset=["Product", "Quantity"])
     df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
