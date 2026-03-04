@@ -3,6 +3,7 @@
 Automated monthly BBL tax report generator for Mountain State Brewing Co.
 
 Upload your QuickBooks sales export → get a completed WV Upload Template instantly.
+QB Report is a saved custom report:  WV Monthly BBL Tax
 
 ---
 
