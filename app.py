@@ -1,10 +1,9 @@
 import streamlit as st
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
 import io
-import json
 import os
+import zipfile
 
 st.set_page_config(
     page_title="WV BBL Tax Reporter",
@@ -60,13 +59,6 @@ h2, h3 {
 .stDownloadButton > button:hover {
     background-color: #3a6a2a;
 }
-.uploadbox {
-    background: #241a08;
-    border: 1px dashed #4a3510;
-    border-radius: 4px;
-    padding: 1rem;
-    margin: 1rem 0;
-}
 .result-box {
     background: #241a08;
     border-left: 3px solid #d4a843;
@@ -84,6 +76,15 @@ h2, h3 {
     font-family: 'Source Code Pro', monospace;
     font-size: 0.85rem;
     color: #d44343;
+}
+.template-saved {
+    background: #0a2a1a;
+    border-left: 3px solid #4a8a5a;
+    padding: 0.5rem 1rem;
+    margin: 0.5rem 0;
+    font-family: 'Source Code Pro', monospace;
+    font-size: 0.85rem;
+    color: #80c880;
 }
 .stExpander {
     border: 1px solid #4a3510 !important;
@@ -113,8 +114,12 @@ DEFAULT_ABCA = {
     "spriggs":                           ("54-T-001-017330", "Spriggs"),
 }
 
+TEMPLATE_PATH = "saved_template.xlsx"
+
 if "abca_map" not in st.session_state:
     st.session_state.abca_map = DEFAULT_ABCA.copy()
+if "results" not in st.session_state:
+    st.session_state.results = []
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_multiplier(product):
@@ -128,12 +133,11 @@ def norm(name):
     return str(name).lower().split(":")[0].strip()
 
 def detect_header_row(uploaded_file):
-    """Find the row containing 'Product/Service' to use as header."""
     raw = pd.read_excel(uploaded_file, header=None)
     for i, row in raw.iterrows():
         if any("product" in str(v).lower() for v in row.values):
             return i
-    return 3  # fallback
+    return 3
 
 def process_file(uploaded_file, template_bytes):
     header_row = detect_header_row(uploaded_file)
@@ -169,26 +173,49 @@ def process_file(uploaded_file, template_bytes):
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
+    return out.read(), len(df), round(df["BBL"].sum(), 4), unmapped
 
-    total_bbl = df["BBL"].sum()
-    return out.read(), len(df), round(total_bbl, 4), unmapped
+def make_zip(results):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for r in results:
+            if not r.get("error") and not r.get("unmapped"):
+                zf.writestr(r["output_name"], r["result_bytes"])
+    buf.seek(0)
+    return buf.read()
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 st.title("🍺 WV BBL Tax Reporter")
 st.markdown("*Mountain State Brewing Co. — Monthly BBL Tax Report Generator*")
 st.markdown("---")
 
-# Template upload
-st.subheader("1. Upload WV Template")
-template_file = st.file_uploader(
-    "Upload __WV_Upload_Template.xlsx",
-    type=["xlsx"],
-    key="template"
-)
+# ── Step 1: Template ──────────────────────────────────────────────────────────
+st.subheader("1. WV Upload Template")
+
+template_bytes = None
+
+if os.path.exists(TEMPLATE_PATH):
+    with open(TEMPLATE_PATH, "rb") as f:
+        template_bytes = f.read()
+    st.markdown('<div class="template-saved">✓ Saved template loaded — <em>__WV_Upload_Template.xlsx</em></div>', unsafe_allow_html=True)
+    if st.button("Replace template"):
+        os.remove(TEMPLATE_PATH)
+        st.rerun()
+else:
+    new_template = st.file_uploader(
+        "Upload __WV_Upload_Template.xlsx (only needed once)",
+        type=["xlsx"],
+        key="template"
+    )
+    if new_template:
+        template_bytes = new_template.read()
+        with open(TEMPLATE_PATH, "wb") as f:
+            f.write(template_bytes)
+        st.markdown('<div class="template-saved">✓ Template saved — won\'t need to upload again!</div>', unsafe_allow_html=True)
 
 st.markdown("---")
 
-# Sales file upload
+# ── Step 2: Sales files ───────────────────────────────────────────────────────
 st.subheader("2. Upload Monthly Sales File(s)")
 sales_files = st.file_uploader(
     "Upload one or more monthly sales exports (e.g. Nov_25.xlsx)",
@@ -199,7 +226,7 @@ sales_files = st.file_uploader(
 
 st.markdown("---")
 
-# ABCA manager
+# ── ABCA manager ──────────────────────────────────────────────────────────────
 with st.expander("⚙️ Manage Distributor ABCA Numbers"):
     st.markdown("**Current mappings:**")
     abca_df = pd.DataFrame([
@@ -227,30 +254,61 @@ with st.expander("⚙️ Manage Distributor ABCA Numbers"):
 
 st.markdown("---")
 
-# Process
+# ── Step 3: Process ───────────────────────────────────────────────────────────
 st.subheader("3. Generate Reports")
 
-if st.button("▶ Process Files", disabled=(not template_file or not sales_files)):
-    template_bytes = template_file.read()
+if st.button("▶ Process Files", disabled=(not template_bytes or not sales_files)):
+    st.session_state.results = []
     for sf in sales_files:
         filename = sf.name.replace(".xlsx", "")
         output_name = f"{filename}_Final.xlsx"
         try:
             sf.seek(0)
             result_bytes, row_count, total_bbl, unmapped = process_file(sf, template_bytes)
-
-            if unmapped:
-                st.markdown(f'<div class="error-box">⚠️ <b>{filename}</b> — {len(unmapped)} unmapped distributor(s): {", ".join(unmapped)}<br>Add them above and re-run.</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="result-box">✓ <b>{output_name}</b> — {row_count} rows &nbsp;|&nbsp; {total_bbl} BBL total</div>', unsafe_allow_html=True)
-                st.download_button(
-                    label=f"⬇ Download {output_name}",
-                    data=result_bytes,
-                    file_name=output_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_{filename}"
-                )
+            st.session_state.results.append({
+                "filename": filename,
+                "output_name": output_name,
+                "result_bytes": result_bytes,
+                "row_count": row_count,
+                "total_bbl": total_bbl,
+                "unmapped": unmapped,
+                "error": None,
+            })
         except Exception as e:
-            st.markdown(f'<div class="error-box">✗ <b>{filename}</b> — Error: {str(e)}</div>', unsafe_allow_html=True)
-elif not template_file or not sales_files:
+            st.session_state.results.append({
+                "filename": filename,
+                "output_name": output_name,
+                "error": str(e),
+            })
+
+if st.session_state.results:
+    successful = [r for r in st.session_state.results if not r.get("error") and not r.get("unmapped")]
+
+    # Download All as ZIP (only shown when multiple successful files)
+    if len(successful) > 1:
+        st.download_button(
+            label=f"⬇ Download All {len(successful)} Files as ZIP",
+            data=make_zip(successful),
+            file_name="BBL_Reports.zip",
+            mime="application/zip",
+            key="dl_zip"
+        )
+        st.markdown("&nbsp;")
+
+    # Individual results
+    for r in st.session_state.results:
+        if r["error"]:
+            st.markdown(f'<div class="error-box">✗ <b>{r["filename"]}</b> — Error: {r["error"]}</div>', unsafe_allow_html=True)
+        elif r["unmapped"]:
+            st.markdown(f'<div class="error-box">⚠️ <b>{r["filename"]}</b> — {len(r["unmapped"])} unmapped distributor(s): {", ".join(r["unmapped"])}<br>Add them in the ABCA manager above and re-run.</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="result-box">✓ <b>{r["output_name"]}</b> — {r["row_count"]} rows &nbsp;|&nbsp; {r["total_bbl"]} BBL total</div>', unsafe_allow_html=True)
+            st.download_button(
+                label=f"⬇ Download {r['output_name']}",
+                data=r["result_bytes"],
+                file_name=r["output_name"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_{r['filename']}"
+            )
+elif not template_bytes or not sales_files:
     st.caption("Upload a template and at least one sales file to enable processing.")
