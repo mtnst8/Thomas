@@ -278,6 +278,7 @@ if st.button("▶ Process Files", disabled=(not template_bytes or not sales_file
             st.session_state.results.append({
                 "filename": filename,
                 "output_name": output_name,
+                "unmapped": [],   # ← always present so downstream checks are safe
                 "error": str(e),
             })
 
@@ -297,10 +298,11 @@ if st.session_state.results:
 
     # Individual results
     for r in st.session_state.results:
-        if r["error"]:
+        if r.get("error"):
             st.markdown(f'<div class="error-box">✗ <b>{r["filename"]}</b> — Error: {r["error"]}</div>', unsafe_allow_html=True)
-        elif r["unmapped"]:
-            st.markdown(f'<div class="error-box">⚠️ <b>{r["filename"]}</b> — {len(r["unmapped"])} unmapped distributor(s): {", ".join(r["unmapped"])}<br>Add them in the ABCA manager above and re-run.</div>', unsafe_allow_html=True)
+        elif r.get("unmapped"):
+            unmapped = r["unmapped"]
+            st.markdown(f'<div class="error-box">⚠️ <b>{r["filename"]}</b> — {len(unmapped)} unmapped distributor(s): {", ".join(str(u) for u in unmapped)}<br>Add them in the ABCA manager above and re-run.</div>', unsafe_allow_html=True)
         else:
             st.markdown(f'<div class="result-box">✓ <b>{r["output_name"]}</b> — {r["row_count"]} rows &nbsp;|&nbsp; {r["total_bbl"]} BBL total</div>', unsafe_allow_html=True)
             st.download_button(
