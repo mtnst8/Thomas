@@ -143,27 +143,56 @@ def detect_header_row(uploaded_file):
 def process_file(uploaded_file, template_bytes):
     header_row = detect_header_row(uploaded_file)
     uploaded_file.seek(0)
-    df = pd.read_excel(uploaded_file, header=header_row)
-    df.columns = ["Col0", "Trans_Date", "Num", "ABCA", "Customer", "Memo", "Quantity"]
 
-    # Keep only actual data rows: Trans_Date must be a real date, Quantity must be numeric
+    # Detect format by column count (new format = 10 cols, old = 7)
+    raw_data = pd.read_excel(uploaded_file, header=None, skiprows=header_row + 1)
+    num_cols = raw_data.shape[1]
+
+    if num_cols >= 10:
+        # New 10-column QuickBooks format (Product/Service full name column present)
+        raw_data.columns = ["Customer", "Trans_Date", "Trans_Type", "Num", "Product", "Memo", "Quantity", "Sales_Price", "Amount", "Balance"]
+        product_col = "Product"
+
+        # Smart customer resolution: sub-customers (e.g. Northern Eagle Elkins) roll up
+        # to their ABCA-mapped parent (Northern Eagle Distributing)
+        customers = []
+        last_top = None
+        last_customer = None
+        for _, row in raw_data.iterrows():
+            val = row["Customer"]
+            if pd.notna(val) and pd.isna(row["Trans_Date"]):
+                s = str(val)
+                if not s.lower().startswith("total"):
+                    n = norm(s)
+                    if n in st.session_state.abca_map:
+                        last_top = s
+                        last_customer = s
+                    else:
+                        last_customer = last_top if last_top else s
+            customers.append(last_customer)
+        raw_data["Customer_filled"] = customers
+
+    else:
+        # Old 7-column format (keg type in Memo column, customer in col 4)
+        raw_data.columns = ["Customer", "Trans_Date", "Num", "ABCA", "Customer_orig", "Memo", "Quantity"]
+        product_col = "Memo"
+        raw_data["Customer_filled"] = raw_data["Customer_orig"].where(raw_data["Customer_orig"].notna()).ffill()
+
+    df = raw_data.copy()
     df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
     df["Trans_Date"] = pd.to_datetime(df["Trans_Date"], errors="coerce")
     df = df.dropna(subset=["Trans_Date", "Quantity"])
-
-    # Filter out subtotal/total rows (non-numeric or zero-row artifacts)
     df = df[df["Quantity"] != 0]
     df["Quantity"] = df["Quantity"].astype(int)
     df["Num"] = df["Num"].astype(str).str.strip()
 
-    # Product/keg type lives in Memo column
-    df["Multiplier"] = df["Memo"].apply(get_multiplier)
+    df["Multiplier"] = df[product_col].apply(get_multiplier)
     df["BBL"] = (df["Quantity"] * df["Multiplier"]).round(4)
-    df["norm"] = df["Customer"].apply(norm)
+    df["norm"] = df["Customer_filled"].apply(norm)
     df["ABCA_Final"] = df["norm"].map(lambda x: st.session_state.abca_map.get(x, (None, None))[0])
     df["Licensee"] = df["norm"].map(lambda x: st.session_state.abca_map.get(x, (None, None))[1])
 
-    unmapped = [c for c in df[df["ABCA_Final"].isna()]["Customer"].unique().tolist()
+    unmapped = [c for c in df[df["ABCA_Final"].isna()]["Customer_filled"].unique().tolist()
                 if pd.notna(c) and str(c).strip().lower() != "nan"]
 
     wb = load_workbook(io.BytesIO(template_bytes))
