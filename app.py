@@ -156,7 +156,8 @@ def process_file(uploaded_file, template_bytes):
     df["ABCA_Final"] = df["norm"].map(lambda x: st.session_state.abca_map.get(x, (None, None))[0])
     df["Licensee"] = df["norm"].map(lambda x: st.session_state.abca_map.get(x, (None, None))[1])
 
-    unmapped = df[df["ABCA_Final"].isna()]["Customer"].unique().tolist()
+    unmapped = [c for c in df[df["ABCA_Final"].isna()]["Customer"].unique().tolist()
+                if pd.notna(c) and str(c).strip().lower() != "nan"]
 
     wb = load_workbook(io.BytesIO(template_bytes))
     ws = wb["Section_2"]
