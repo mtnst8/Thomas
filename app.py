@@ -123,10 +123,10 @@ if "results" not in st.session_state:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_multiplier(product):
-    p = str(product).lower()
-    if "1/2 bbl" in p: return 0.5
-    elif "1/6 bbl" in p: return 0.166667
-    elif "can" in p: return 0.07258
+    p = str(product).lower().replace(" ", "")
+    if "1/2bbl" in p: return 0.5
+    elif "1/6bbl" in p: return 0.166667
+    elif "can" in str(product).lower(): return 0.07258
     return None
 
 def norm(name):
@@ -135,22 +135,29 @@ def norm(name):
 def detect_header_row(uploaded_file):
     raw = pd.read_excel(uploaded_file, header=None)
     for i, row in raw.iterrows():
-        if any("product" in str(v).lower() for v in row.values):
+        vals = [str(v).lower() for v in row.values]
+        if any("transaction date" in v or "quantity" in v for v in vals):
             return i
-    return 3
+    return 4
 
 def process_file(uploaded_file, template_bytes):
     header_row = detect_header_row(uploaded_file)
     uploaded_file.seek(0)
     df = pd.read_excel(uploaded_file, header=header_row)
-    df.columns = ["Product", "Trans_Date", "Num", "ABCA", "Customer", "Memo", "Quantity"]
-    df = df[df["Product"] != "TOTAL"].dropna(subset=["Product", "Quantity"])
+    df.columns = ["Col0", "Trans_Date", "Num", "ABCA", "Customer", "Memo", "Quantity"]
+
+    # Keep only actual data rows: Trans_Date must be a real date, Quantity must be numeric
     df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
-    df = df.dropna(subset=["Quantity"])
+    df["Trans_Date"] = pd.to_datetime(df["Trans_Date"], errors="coerce")
+    df = df.dropna(subset=["Trans_Date", "Quantity"])
+
+    # Filter out subtotal/total rows (non-numeric or zero-row artifacts)
+    df = df[df["Quantity"] != 0]
     df["Quantity"] = df["Quantity"].astype(int)
-    df["Trans_Date"] = pd.to_datetime(df["Trans_Date"])
     df["Num"] = df["Num"].astype(str).str.strip()
-    df["Multiplier"] = df["Product"].apply(get_multiplier)
+
+    # Product/keg type lives in Memo column
+    df["Multiplier"] = df["Memo"].apply(get_multiplier)
     df["BBL"] = (df["Quantity"] * df["Multiplier"]).round(4)
     df["norm"] = df["Customer"].apply(norm)
     df["ABCA_Final"] = df["norm"].map(lambda x: st.session_state.abca_map.get(x, (None, None))[0])
