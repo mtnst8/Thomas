@@ -1,50 +1,36 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+import requests
+import json as _json
 from openpyxl import load_workbook, Workbook
 import io
 import zipfile
 from pathlib import Path
 from datetime import datetime
 
-st.set_page_config(
-    page_title="WV BBL Tax Reporter",
-    page_icon="🍺",
-    layout="centered"
-)
+st.set_page_config(page_title="WV BBL Tax Reporter", page_icon="🍺", layout="centered")
 
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Libre+Baskerville:wght@400;700&family=Source+Code+Pro:wght@400;600&display=swap');
-
 html, body, [class*="css"] { font-family: 'Libre Baskerville', serif; }
 .stApp { background-color: #1a1208; color: #f0e6c8; }
-h1 {
-    font-family: 'Libre Baskerville', serif; color: #d4a843; font-size: 2rem;
-    letter-spacing: 0.04em; border-bottom: 1px solid #4a3510; padding-bottom: 0.5rem;
-}
+h1 { font-family: 'Libre Baskerville', serif; color: #d4a843; font-size: 2rem;
+     letter-spacing: 0.04em; border-bottom: 1px solid #4a3510; padding-bottom: 0.5rem; }
 h2, h3 { font-family: 'Libre Baskerville', serif; color: #d4a843; }
-.stButton > button {
-    background-color: #d4a843; color: #1a1208; font-family: 'Libre Baskerville', serif;
-    font-weight: 700; border: none; border-radius: 2px; padding: 0.5rem 1.5rem; letter-spacing: 0.05em;
-}
+.stButton > button { background-color: #d4a843; color: #1a1208; font-family: 'Libre Baskerville', serif;
+     font-weight: 700; border: none; border-radius: 2px; padding: 0.5rem 1.5rem; letter-spacing: 0.05em; }
 .stButton > button:hover { background-color: #e8c060; color: #1a1208; }
-.stDownloadButton > button {
-    background-color: #2a4a1a; color: #a0d080; font-family: 'Source Code Pro', monospace;
-    border: 1px solid #4a7a2a; border-radius: 2px; width: 100%;
-}
+.stDownloadButton > button { background-color: #2a4a1a; color: #a0d080; font-family: 'Source Code Pro', monospace;
+     border: 1px solid #4a7a2a; border-radius: 2px; width: 100%; }
 .stDownloadButton > button:hover { background-color: #3a6a2a; }
-.result-box {
-    background: #241a08; border-left: 3px solid #d4a843; padding: 0.75rem 1rem; margin: 0.5rem 0;
-    font-family: 'Source Code Pro', monospace; font-size: 0.85rem; color: #c8b888;
-}
-.error-box {
-    background: #2a0808; border-left: 3px solid #d44343; padding: 0.75rem 1rem; margin: 0.5rem 0;
-    font-family: 'Source Code Pro', monospace; font-size: 0.85rem; color: #d44343;
-}
-.template-saved {
-    background: #0a2a1a; border-left: 3px solid #4a8a5a; padding: 0.5rem 1rem; margin: 0.5rem 0;
-    font-family: 'Source Code Pro', monospace; font-size: 0.85rem; color: #80c880;
-}
+.result-box { background: #241a08; border-left: 3px solid #d4a843; padding: 0.75rem 1rem; margin: 0.5rem 0;
+     font-family: 'Source Code Pro', monospace; font-size: 0.85rem; color: #c8b888; }
+.error-box { background: #2a0808; border-left: 3px solid #d44343; padding: 0.75rem 1rem; margin: 0.5rem 0;
+     font-family: 'Source Code Pro', monospace; font-size: 0.85rem; color: #d44343; }
+.template-saved { background: #0a2a1a; border-left: 3px solid #4a8a5a; padding: 0.5rem 1rem; margin: 0.5rem 0;
+     font-family: 'Source Code Pro', monospace; font-size: 0.85rem; color: #80c880; }
 .stExpander { border: 1px solid #4a3510 !important; background: #241a08 !important; }
 label, .stFileUploader label { color: #c8b888 !important; }
 .stDataFrame { font-family: 'Source Code Pro', monospace; font-size: 0.8rem; }
@@ -53,14 +39,14 @@ hr { border-color: #4a3510; }
 """, unsafe_allow_html=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-GAL_PER_BBL = 31                       # WV ABCA: 1 barrel = 31 gallons
-FACILITY_CAPACITY_BBL = 5000           # Q3 — production capacity (constant)
+GAL_PER_BBL = 31
+FACILITY_CAPACITY_BBL = 5000
 BREWER_NAME = "Mountain State Brewing Co."
-LICENSE_NUMBER = "47-W-002-000225"     # WV brewer license #
-
-# Template ships WITH the repo so it survives Streamlit Cloud reboots.
-# Commit __WV_Upload_Template.xlsx to the repo root (same folder as app.py).
+LICENSE_NUMBER = "47-W-002-000225"          # built-in default if the sheet is unreachable
 TEMPLATE_PATH = Path(__file__).parent / "__WV_Upload_Template.xlsx"
+HIST_HEADERS = ["Fiscal Year", "Total Sales (gallons)", "Total Sales (barrels)",
+                "WV Distributor (gallons)", "Self-distributed (gallons)",
+                "Brewpub (gallons)", "Other State (gallons)", "Generated"]
 
 DEFAULT_ABCA = {
     "jefferson distributing co., inc.": ("02-T-001-000021", "Jefferson Distributing Co., Inc."),
@@ -78,12 +64,56 @@ if "results" not in st.session_state:
     st.session_state.results = []
 if "eop" not in st.session_state:
     st.session_state.eop = None
-if "license_no" not in st.session_state:
-    st.session_state.license_no = LICENSE_NUMBER
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Storage layer: Google Apps Script web app ───────────────────────────────────
+def _gas_cfg():
+    try:
+        return st.secrets["gas"]["url"], st.secrets["gas"]["token"]
+    except Exception:
+        return None, None
+
+def storage_ready():
+    url, token = _gas_cfg()
+    return bool(url and token)
+
+def _jsonable(o):
+    if isinstance(o, np.integer):  return int(o)
+    if isinstance(o, np.floating): return float(o)
+    return str(o)
+
+def _gas_post(payload):
+    url, token = _gas_cfg()
+    if not url or not token:
+        return None
+    try:
+        body = _json.dumps({**payload, "token": token}, default=_jsonable)
+        r = requests.post(url, data=body, headers={"Content-Type": "application/json"}, timeout=20)
+        data = r.json()
+        return data if data.get("ok") else None
+    except Exception:
+        return None
+
+def gas_get_license():
+    d = _gas_post({"action": "get_license"})
+    return ((d or {}).get("license") or None)
+
+def gas_set_license(value):
+    return _gas_post({"action": "set_license", "value": value}) is not None
+
+def gas_get_history():
+    d = _gas_post({"action": "get_history"})
+    rows = (d or {}).get("rows", [])
+    return pd.DataFrame(rows, columns=HIST_HEADERS) if rows else pd.DataFrame(columns=HIST_HEADERS)
+
+def gas_upsert_history(new_row):
+    d = _gas_post({"action": "upsert_history", "row": new_row})
+    if not d:
+        return None
+    rows = d.get("rows", [])
+    return pd.DataFrame(rows, columns=HIST_HEADERS) if rows else pd.DataFrame(columns=HIST_HEADERS)
+
+# ── Parsing / multipliers ───────────────────────────────────────────────────────
 def get_multiplier(text):
-    """Container -> 31-gal barrels.  1/2 BBL=0.5, 1/6 BBL=0.166667, can-case=0.07258."""
     s = str(text).lower().replace(" ", "")
     if "1/2bbl" in s: return 0.5
     if "1/6bbl" in s: return 0.166667
@@ -91,8 +121,6 @@ def get_multiplier(text):
     return None
 
 def multiplier_for(product, memo):
-    """Prefer the Product name; fall back to Description (some items, e.g. Otter
-    Creek, carry the keg size only in the Description column)."""
     m = get_multiplier(product)
     return m if m is not None else get_multiplier(memo)
 
@@ -100,20 +128,9 @@ def norm(name):
     return str(name).lower().split(":")[0].strip()
 
 def category_of(product):
-    """Channel category = text before the first ':' in the Product/Service name."""
     return str(product).split(":")[0].strip()
 
 def classify_category(cat):
-    """
-    Map a product category to an EOP channel. Order matters: keg deposits and
-    merchandise are filtered out before the distributor checks (they also contain
-    the word 'Distributor').
-        wv_dist      -> Q8/Q9  (1 WV Distributor)
-        self         -> Q6/Q7  (2 Self Distribute)
-        brewpub      -> Q10/Q11
-        other_state  -> counts toward total only (3/4 = MD, etc.)
-        exclude      -> keg deposits, tap handles, services, blanks
-    """
     c = str(cat).strip().lower()
     if c in ("", "nan") or "kegs" in c or "tap handle" in c or "service" in c:
         return "exclude"
@@ -128,12 +145,9 @@ def classify_category(cat):
     return "unclassified"
 
 CHANNEL_LABEL = {
-    "wv_dist": "WV distributors (Q8/Q9)",
-    "self": "Self-distribution (Q6/Q7)",
-    "brewpub": "Brewpub (Q10/Q11)",
-    "other_state": "Other state (total only)",
-    "exclude": "Excluded (deposits/merch/services)",
-    "unclassified": "UNCLASSIFIED - please review",
+    "wv_dist": "WV distributors (Q8/Q9)", "self": "Self-distribution (Q6/Q7)",
+    "brewpub": "Brewpub (Q10/Q11)", "other_state": "Other state (total only)",
+    "exclude": "Excluded (deposits/merch/services)", "unclassified": "UNCLASSIFIED - please review",
 }
 
 def detect_header_row(uploaded_file):
@@ -152,11 +166,9 @@ def load_template_bytes(override_file=None):
     return None
 
 def parse_sales_file(uploaded_file):
-    """Shared parser for both the monthly tax report and the yearly EOP report."""
     uploaded_file.seek(0)
     header_row = detect_header_row(uploaded_file)
     uploaded_file.seek(0)
-
     raw_data = pd.read_excel(uploaded_file, header=None, skiprows=header_row + 1)
     num_cols = raw_data.shape[1]
 
@@ -164,14 +176,7 @@ def parse_sales_file(uploaded_file):
         raw_data.columns = ["Customer", "Trans_Date", "Trans_Type", "Num", "Product",
                             "Memo", "Quantity", "Sales_Price", "Amount", "Balance"]
         product_col = "Product"
-
-        # Resolve customers. A non-mapped header rolls up to the previous mapped
-        # distributor ONLY if it shares its leading word (e.g. "Northern Eagle
-        # Elkins" -> "Northern Eagle Distributing"). MSBC locations keep their own
-        # identity instead of folding into whatever distributor came before them.
-        customers = []
-        last_top = None
-        last_customer = None
+        customers, last_top, last_customer = [], None, None
         for _, row in raw_data.iterrows():
             val = row["Customer"]
             if pd.notna(val) and pd.isna(row["Trans_Date"]):
@@ -182,11 +187,8 @@ def parse_sales_file(uploaded_file):
                         last_top = s
                         last_customer = s
                     else:
-                        same_stem = (
-                            last_top
-                            and s.strip().lower().split()[:1]
-                            == str(last_top).strip().lower().split()[:1]
-                        )
+                        same_stem = (last_top and s.strip().lower().split()[:1]
+                                     == str(last_top).strip().lower().split()[:1])
                         last_customer = last_top if same_stem else s
             customers.append(last_customer)
         raw_data["Customer_filled"] = customers
@@ -203,7 +205,6 @@ def parse_sales_file(uploaded_file):
     df = df[df["Quantity"] != 0]
     df["Quantity"] = df["Quantity"].astype(int)
     df["Num"] = df["Num"].astype(str).str.strip()
-
     df["Multiplier"] = df.apply(lambda r: multiplier_for(r[product_col], r.get("Memo")), axis=1)
     df["BBL"] = (df["Quantity"] * df["Multiplier"]).round(4)
     df["Gallons"] = (df["BBL"] * GAL_PER_BBL).round(2)
@@ -216,14 +217,9 @@ def parse_sales_file(uploaded_file):
 
 def process_file(uploaded_file, template_bytes):
     df, product_col = parse_sales_file(uploaded_file)
-
-    # Keg deposits (6 Kegs), tap handles and services aren't taxable beer — keep
-    # them off the tax report and out of the unmapped-distributor check.
-    df = df[df["Channel"] != "exclude"]
-
+    df = df[df["Channel"] != "exclude"]   # keg deposits / tap handles / services aren't taxable beer
     unmapped = [c for c in df[df["ABCA_Final"].isna()]["Customer_filled"].unique().tolist()
                 if pd.notna(c) and str(c).strip().lower() != "nan"]
-
     wb = load_workbook(io.BytesIO(template_bytes))
     ws = wb["Section_2"]
     for i, row in enumerate(df.itertuples(index=False), 6):
@@ -234,9 +230,7 @@ def process_file(uploaded_file, template_bytes):
         ws.cell(row=i, column=4, value=row.Licensee)
         ws.cell(row=i, column=5, value=round(row.BBL, 4))
         ws.cell(row=i, column=5).number_format = "0.0000"
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
+    out = io.BytesIO(); wb.save(out); out.seek(0)
     return out.read(), len(df), round(df["BBL"].sum(), 4), unmapped
 
 def make_zip(results):
@@ -248,37 +242,24 @@ def make_zip(results):
     buf.seek(0)
     return buf.read()
 
-# ── EOP (Production Estimate/Report) helpers ────────────────────────────────────
+# ── EOP helpers ──────────────────────────────────────────────────────────────────
 def summarize_year(df):
-    """Aggregate the year by channel (derived from the product category)."""
     def gb(d):
         return round(d["Gallons"].sum(), 2), round(d["BBL"].sum(), 4)
-
     by_channel = {ch: gb(df[df["Channel"] == ch]) for ch in CHANNEL_LABEL}
-
     cat = (df.assign(Channel_label=df["Channel"].map(CHANNEL_LABEL))
              .groupby(["Category", "Channel_label"], as_index=False)
              .agg(Gallons=("Gallons", "sum"), BBL=("BBL", "sum"))
              .sort_values("Gallons", ascending=False, key=lambda s: s.abs())
              .round({"Gallons": 2, "BBL": 4}))
-
     beer = df[df["Channel"].isin(["wv_dist", "self", "brewpub", "other_state"])]
     total_g, total_b = gb(beer)
-
-    return {
-        "by_channel": by_channel,
-        "cat_table": cat,
-        "total_g": total_g, "total_b": total_b,
-        "period_start": df["Trans_Date"].min(),
-        "period_end": df["Trans_Date"].max(),
-        "row_count": len(df),
-        "has_unclassified": bool((df["Channel"] == "unclassified").any()),
-    }
+    return {"by_channel": by_channel, "cat_table": cat, "total_g": total_g, "total_b": total_b,
+            "period_start": df["Trans_Date"].min(), "period_end": df["Trans_Date"].max(),
+            "row_count": len(df), "has_unclassified": bool((df["Channel"] == "unclassified").any())}
 
 def build_eop_summary(v):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "EOP_Summary"
+    wb = Workbook(); ws = wb.active; ws.title = "EOP_Summary"
     rows = [
         ["WV Estimate/Report of Production", ""],
         ["Brewer", v.get("brewer", BREWER_NAME)],
@@ -304,36 +285,18 @@ def build_eop_summary(v):
         ["", ""],
         ["(Out-of-state sales, in total but no WV line) gallons", v["other_g"]],
     ]
-    for r in rows:
-        ws.append(r)
+    for r in rows: ws.append(r)
     ws.column_dimensions["A"].width = 48
     ws.column_dimensions["B"].width = 28
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
+    out = io.BytesIO(); wb.save(out); out.seek(0)
     return out.read()
 
-def build_history(prior_bytes, new_row):
-    cols = ["Fiscal Year", "Total Sales (gallons)", "Total Sales (barrels)",
-            "WV Distributor (gallons)", "Self-distributed (gallons)",
-            "Brewpub (gallons)", "Other State (gallons)", "Generated"]
-    if prior_bytes:
-        try:
-            hist = pd.read_excel(io.BytesIO(prior_bytes))
-        except Exception:
-            hist = pd.DataFrame(columns=cols)
-    else:
-        hist = pd.DataFrame(columns=cols)
-    hist = hist[hist["Fiscal Year"].astype(str) != str(new_row["Fiscal Year"])]
-    hist = pd.concat([hist, pd.DataFrame([new_row])], ignore_index=True)
-    hist = hist.sort_values("Fiscal Year").reset_index(drop=True)
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as w:
-        hist.to_excel(w, index=False, sheet_name="Production_History")
-    out.seek(0)
-    return out.read(), hist
+# ── Connect + resolve license ────────────────────────────────────────────────────
+sheets_ok = storage_ready()
+if "license_no" not in st.session_state:
+    st.session_state.license_no = (gas_get_license() or LICENSE_NUMBER) if sheets_ok else LICENSE_NUMBER
 
-# ── UI ──────────────────────────────────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────────
 st.title("🍺 WV BBL Tax Reporter")
 st.markdown(f"*{BREWER_NAME} — License #{st.session_state.license_no}*")
 st.markdown("---")
@@ -352,24 +315,21 @@ with tab_tax:
                                     type=["xlsx"], key="template_override")
     else:
         st.markdown('<div class="error-box">⚠️ No template in the repo. Commit '
-                    '<em>__WV_Upload_Template.xlsx</em> to the repo root, or upload one '
-                    'below for this session.</div>', unsafe_allow_html=True)
+                    '<em>__WV_Upload_Template.xlsx</em> to the repo root, or upload one below.</div>',
+                    unsafe_allow_html=True)
         override = st.file_uploader("Upload __WV_Upload_Template.xlsx", type=["xlsx"], key="template_override")
     template_bytes = load_template_bytes(override)
 
     st.markdown("---")
     st.subheader("2. Upload Monthly Sales File(s)")
-    sales_files = st.file_uploader(
-        "Upload one or more monthly sales exports (e.g. Nov_25.xlsx)",
-        type=["xlsx"], accept_multiple_files=True, key="sales")
+    sales_files = st.file_uploader("Upload one or more monthly sales exports (e.g. Nov_25.xlsx)",
+                                   type=["xlsx"], accept_multiple_files=True, key="sales")
 
     st.markdown("---")
     with st.expander("⚙️ Manage Distributor ABCA Numbers"):
-        abca_df = pd.DataFrame([
-            {"Distributor (lowercase key)": k, "ABCA License #": val[0], "Display Name": val[1]}
-            for k, val in st.session_state.abca_map.items()])
+        abca_df = pd.DataFrame([{"Distributor (lowercase key)": k, "ABCA License #": val[0], "Display Name": val[1]}
+                                for k, val in st.session_state.abca_map.items()])
         st.dataframe(abca_df, use_container_width=True, hide_index=True)
-        st.markdown("**Add a new distributor:**")
         col1, col2, col3 = st.columns(3)
         with col1: new_key = st.text_input("Customer name (as in QuickBooks)", key="new_key")
         with col2: new_abca = st.text_input("ABCA License #", key="new_abca")
@@ -377,8 +337,7 @@ with tab_tax:
         if st.button("Add Distributor"):
             if new_key and new_abca and new_display:
                 st.session_state.abca_map[norm(new_key)] = (new_abca, new_display)
-                st.success(f"Added: {new_display}")
-                st.rerun()
+                st.success(f"Added: {new_display}"); st.rerun()
             else:
                 st.warning("Please fill in all three fields.")
 
@@ -391,52 +350,63 @@ with tab_tax:
             output_name = f"{filename}_Final.xlsx"
             try:
                 sf.seek(0)
-                result_bytes, row_count, total_bbl, unmapped = process_file(sf, template_bytes)
-                st.session_state.results.append({
-                    "filename": filename, "output_name": output_name, "result_bytes": result_bytes,
-                    "row_count": row_count, "total_bbl": total_bbl, "unmapped": unmapped, "error": None})
+                rb, rc, tb, um = process_file(sf, template_bytes)
+                st.session_state.results.append({"filename": filename, "output_name": output_name,
+                    "result_bytes": rb, "row_count": rc, "total_bbl": tb, "unmapped": um, "error": None})
             except Exception as e:
-                st.session_state.results.append({
-                    "filename": filename, "output_name": output_name, "unmapped": [], "error": str(e)})
+                st.session_state.results.append({"filename": filename, "output_name": output_name,
+                    "unmapped": [], "error": str(e)})
 
     if st.session_state.results:
         successful = [r for r in st.session_state.results if not r.get("error") and not r.get("unmapped")]
         if len(successful) > 1:
-            st.download_button(f"⬇ Download All {len(successful)} Files as ZIP",
-                data=make_zip(successful), file_name="BBL_Reports.zip",
-                mime="application/zip", key="dl_zip")
+            st.download_button(f"⬇ Download All {len(successful)} Files as ZIP", data=make_zip(successful),
+                file_name="BBL_Reports.zip", mime="application/zip", key="dl_zip")
             st.markdown("&nbsp;")
         for r in st.session_state.results:
             if r.get("error"):
                 st.markdown(f'<div class="error-box">✗ <b>{r["filename"]}</b> — Error: {r["error"]}</div>', unsafe_allow_html=True)
             elif r.get("unmapped"):
                 u = r["unmapped"]
-                st.markdown(f'<div class="error-box">⚠️ <b>{r["filename"]}</b> — {len(u)} unmapped distributor(s): {", ".join(str(x) for x in u)}<br>Add them in the ABCA manager above and re-run.</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="error-box">⚠️ <b>{r["filename"]}</b> — {len(u)} unmapped: {", ".join(str(x) for x in u)}<br>Add them in the ABCA manager above and re-run.</div>', unsafe_allow_html=True)
             else:
                 st.markdown(f'<div class="result-box">✓ <b>{r["output_name"]}</b> — {r["row_count"]} rows &nbsp;|&nbsp; {r["total_bbl"]} BBL total</div>', unsafe_allow_html=True)
-                st.download_button(f"⬇ Download {r['output_name']}", data=r["result_bytes"],
-                    file_name=r["output_name"],
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_{r['filename']}")
+                st.download_button(f"⬇ Download {r['output_name']}", data=r["result_bytes"], file_name=r["output_name"],
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"dl_{r['filename']}")
     elif not template_bytes or not sales_files:
         st.caption("Upload a template and at least one sales file to enable processing.")
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  TAB 2 — WV Estimate/Report of Production (ABCA-NONRETAIL-EOP)
+#  TAB 2 — WV Estimate/Report of Production
 # ════════════════════════════════════════════════════════════════════════════════
 with tab_eop:
     st.subheader("WV Estimate/Report of Production")
     st.markdown(f'<div class="result-box">Brewer: <b>{BREWER_NAME}</b></div>', unsafe_allow_html=True)
+
     license_no = st.text_input("WV brewer license #", value=st.session_state.license_no, key="license_input")
-    st.session_state.license_no = license_no
+    if license_no != st.session_state.license_no:
+        st.session_state.license_no = license_no
+        if sheets_ok and gas_set_license(license_no):
+            st.toast("License number saved to the sheet")
+
+    if sheets_ok:
+        st.markdown('<div class="template-saved">✓ Connected to the sheet — license & history save '
+                    'automatically.</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="error-box">Sheet not connected yet — using the built-in license default '
+                    'and the file fallback for history. Add the web-app URL + token to Streamlit secrets to '
+                    'turn on auto-save.</div>', unsafe_allow_html=True)
+
     st.caption("Channel is read from the product category: 1 = WV distributors, 2 = self-distribute, "
                "3/4 = other states. Keg deposits (6), tap handles (7) and services are ignored. "
                "Barrels are 31 gallons.")
 
     fy = st.text_input("Fiscal year label", value="", placeholder="e.g. 2025-2026", key="fy")
     year_file = st.file_uploader("Upload the year's sales export (raw dump .xlsx)", type=["xlsx"], key="year_file")
-    prior_history = st.file_uploader(
-        "Optional: prior production_history.xlsx (running year-to-year record)", type=["xlsx"], key="hist")
+    prior_history = None
+    if not sheets_ok:
+        prior_history = st.file_uploader(
+            "Optional: prior production_history.xlsx (fallback when the sheet is offline)", type=["xlsx"], key="hist")
 
     if st.button("▶ Analyze Year", disabled=(not year_file)):
         try:
@@ -452,33 +422,25 @@ with tab_eop:
     v = st.session_state.eop
     if v:
         bc = v["by_channel"]
-        wv_g, wv_b = bc["wv_dist"]
-        self_g, self_b = bc["self"]
-        bp_data_g, bp_data_b = bc["brewpub"]   # from data (usually 0)
-        other_g, other_b = bc["other_state"]
+        wv_g, wv_b = bc["wv_dist"]; self_g, self_b = bc["self"]
+        bp_data_g, bp_data_b = bc["brewpub"]; other_g, other_b = bc["other_state"]
 
-        st.markdown(
-            f'<div class="result-box">Period in file: '
-            f'<b>{v["period_start"]:%m/%d/%Y}</b> – <b>{v["period_end"]:%m/%d/%Y}</b> '
-            f'&nbsp;|&nbsp; {v["row_count"]} line items</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="result-box">Period in file: '
+                    f'<b>{v["period_start"]:%m/%d/%Y}</b> – <b>{v["period_end"]:%m/%d/%Y}</b> '
+                    f'&nbsp;|&nbsp; {v["row_count"]} line items</div>', unsafe_allow_html=True)
 
         if v["has_unclassified"]:
-            st.markdown('<div class="error-box">⚠️ One or more product categories couldn\'t be '
-                        'classified and were left OUT of the totals. See the category audit below.</div>',
-                        unsafe_allow_html=True)
-
+            st.markdown('<div class="error-box">⚠️ One or more product categories couldn\'t be classified '
+                        'and were left OUT of the totals. See the category audit below.</div>', unsafe_allow_html=True)
         with st.expander("Category audit (every category and where it landed)", expanded=v["has_unclassified"]):
             st.dataframe(v["cat_table"], use_container_width=True, hide_index=True)
 
         # Brewpub (Q10/Q11): entered in BARRELS, converts to gallons, rolls into the total
-        bp_b_final = st.number_input(
-            "Brewpub sales (barrels) — Q10/Q11, manual entry",
+        bp_b_final = st.number_input("Brewpub sales (barrels) — Q10/Q11, manual entry",
             min_value=0.0, value=float(bp_data_b), step=1.0, key="bp_bbl",
-            help="No brewpub category exists in the sales data, so enter it here. "
-                 "It converts to gallons and is added to the totals below.")
+            help="No brewpub category exists in the sales data, so enter it here. It converts to gallons "
+                 "and is added to the totals below.")
         bp_g_final = round(bp_b_final * GAL_PER_BBL, 2)
-
-        # Total = data total, minus any data-brewpub, plus the manual brewpub
         total_b_final = round(v["total_b"] - bp_data_b + bp_b_final, 4)
         total_g_final = round(v["total_g"] - bp_data_g + bp_g_final, 2)
 
@@ -496,51 +458,71 @@ with tab_eop:
         st.markdown("**Production-side figures (you confirm these):**")
         cga, cgb = st.columns(2)
         with cga:
-            q1_gal = st.number_input("Q1 — Est. gallons produced this year",
-                min_value=0.0, value=float(total_g_final), step=100.0, key="q1",
-                help="Prefilled with total sales gallons (incl. brewpub) as a starting point. Adjust to your production estimate.")
+            q1_gal = st.number_input("Q1 — Est. gallons produced this year", min_value=0.0,
+                value=float(total_g_final), step=100.0, key="q1",
+                help="Prefilled with total sales gallons (incl. brewpub). Adjust to your production estimate.")
         with cgb:
             q4_gal = st.number_input("Q4 — Prior year total production (gallons)",
                 min_value=0.0, value=0.0, step=100.0, key="q4")
         q2_bbl = round(q1_gal / GAL_PER_BBL, 2)
-        st.markdown(
-            f'<div class="result-box">'
-            f'Q2 — Est. barrels produced (Q1 ÷ 31): <b>{q2_bbl}</b> bbl<br>'
-            f'Q3 — Production capacity (constant): <b>{FACILITY_CAPACITY_BBL:,}</b> bbl '
-            f'({FACILITY_CAPACITY_BBL * GAL_PER_BBL:,} gal)</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="result-box">Q2 — Est. barrels produced (Q1 ÷ 31): <b>{q2_bbl}</b> bbl<br>'
+                    f'Q3 — Production capacity (constant): <b>{FACILITY_CAPACITY_BBL:,}</b> bbl '
+                    f'({FACILITY_CAPACITY_BBL * GAL_PER_BBL:,} gal)</div>', unsafe_allow_html=True)
 
+        fiscal_year = fy or f"{v['period_start']:%Y}-{v['period_end']:%Y}"
         values = {
-            "fiscal_year": fy or f"{v['period_start']:%Y}-{v['period_end']:%Y}",
-            "period_start": v["period_start"], "period_end": v["period_end"],
-            "brewer": BREWER_NAME, "license": license_no,
+            "fiscal_year": fiscal_year, "period_start": v["period_start"], "period_end": v["period_end"],
+            "brewer": BREWER_NAME, "license": st.session_state.license_no,
             "q1_gal": q1_gal, "q2_bbl": q2_bbl, "q3_bbl": FACILITY_CAPACITY_BBL, "q4_gal": q4_gal,
             "total_g": total_g_final, "total_b": total_b_final,
-            "self_g": self_g, "self_b": self_b,
-            "dist_g": wv_g, "dist_b": wv_b,
-            "bp_g": bp_g_final, "bp_b": bp_b_final,
-            "other_g": other_g, "other_b": other_b,
+            "self_g": self_g, "self_b": self_b, "dist_g": wv_g, "dist_b": wv_b,
+            "bp_g": bp_g_final, "bp_b": bp_b_final, "other_g": other_g, "other_b": other_b,
         }
 
         st.markdown("---")
-        st.download_button("⬇ Download EOP Summary (all 11 lines, labeled)",
-            data=build_eop_summary(values),
-            file_name=f"WV_Production_{values['fiscal_year']}.xlsx",
+        st.download_button("⬇ Download EOP Summary (all 11 lines, labeled)", data=build_eop_summary(values),
+            file_name=f"WV_Production_{fiscal_year}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_eop")
 
         new_row = {
-            "Fiscal Year": values["fiscal_year"],
-            "Total Sales (gallons)": total_g_final, "Total Sales (barrels)": total_b_final,
-            "WV Distributor (gallons)": wv_g, "Self-distributed (gallons)": self_g,
-            "Brewpub (gallons)": bp_g_final, "Other State (gallons)": other_g,
+            "Fiscal Year": fiscal_year,
+            "Total Sales (gallons)": float(total_g_final), "Total Sales (barrels)": float(total_b_final),
+            "WV Distributor (gallons)": float(wv_g), "Self-distributed (gallons)": float(self_g),
+            "Brewpub (gallons)": float(bp_g_final), "Other State (gallons)": float(other_g),
             "Generated": datetime.now().strftime("%Y-%m-%d"),
         }
-        hist_bytes, hist_df = build_history(v.get("prior_history_bytes"), new_row)
+
+        st.markdown("---")
         st.markdown("**Year-to-year history (gallons):**")
-        st.dataframe(hist_df, use_container_width=True, hide_index=True)
-        st.download_button("⬇ Download updated production_history.xlsx",
-            data=hist_bytes, file_name="production_history.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_hist")
-        st.caption("Keep this file. Re-upload it next year and it appends the new year automatically; "
-                   "re-running the same fiscal year overwrites that row.")
+        if sheets_ok:
+            if st.button(f"💾 Save / update {fiscal_year} in the sheet"):
+                updated = gas_upsert_history(new_row)
+                if updated is not None:
+                    st.toast(f"{fiscal_year} saved to the sheet")
+                else:
+                    st.markdown('<div class="error-box">Could not write to the sheet — check the web-app URL/token.</div>',
+                                unsafe_allow_html=True)
+            st.dataframe(gas_get_history(), use_container_width=True, hide_index=True)
+            st.caption("History lives in 'MSBC WV Production Data' on your Drive — no files to download.")
+        else:
+            if v.get("prior_history_bytes"):
+                try:
+                    hist = pd.read_excel(io.BytesIO(v["prior_history_bytes"]))
+                except Exception:
+                    hist = pd.DataFrame(columns=HIST_HEADERS)
+            else:
+                hist = pd.DataFrame(columns=HIST_HEADERS)
+            if "Fiscal Year" in hist.columns:
+                hist = hist[hist["Fiscal Year"].astype(str) != str(fiscal_year)]
+            hist = pd.concat([hist, pd.DataFrame([new_row])], ignore_index=True).sort_values("Fiscal Year").reset_index(drop=True)
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine="openpyxl") as w:
+                hist.to_excel(w, index=False, sheet_name="Production_History")
+            out.seek(0)
+            st.dataframe(hist, use_container_width=True, hide_index=True)
+            st.download_button("⬇ Download updated production_history.xlsx", data=out.read(),
+                file_name="production_history.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_hist")
+            st.caption("Fallback mode. Connect the web app to drop the file step.")
     elif not year_file:
         st.caption("Upload the year's raw-dump export to enable analysis.")
