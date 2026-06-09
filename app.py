@@ -78,6 +78,8 @@ if "results" not in st.session_state:
     st.session_state.results = []
 if "eop" not in st.session_state:
     st.session_state.eop = None
+if "license_no" not in st.session_state:
+    st.session_state.license_no = LICENSE_NUMBER
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_multiplier(text):
@@ -279,8 +281,8 @@ def build_eop_summary(v):
     ws.title = "EOP_Summary"
     rows = [
         ["WV Estimate/Report of Production", ""],
-        ["Brewer", BREWER_NAME],
-        ["License Number", LICENSE_NUMBER],
+        ["Brewer", v.get("brewer", BREWER_NAME)],
+        ["License Number", v.get("license", LICENSE_NUMBER)],
         ["Generated", datetime.now().strftime("%Y-%m-%d %H:%M")],
         ["Fiscal Year", v["fiscal_year"]],
         ["Data period (from file)", f"{v['period_start']:%m/%d/%Y} - {v['period_end']:%m/%d/%Y}"],
@@ -333,7 +335,7 @@ def build_history(prior_bytes, new_row):
 
 # ── UI ──────────────────────────────────────────────────────────────────────────
 st.title("🍺 WV BBL Tax Reporter")
-st.markdown(f"*{BREWER_NAME} — License #{LICENSE_NUMBER}*")
+st.markdown(f"*{BREWER_NAME} — License #{st.session_state.license_no}*")
 st.markdown("---")
 
 tab_tax, tab_eop = st.tabs(["Monthly BBL Tax Report", "Production Estimate/Report"])
@@ -424,8 +426,9 @@ with tab_tax:
 # ════════════════════════════════════════════════════════════════════════════════
 with tab_eop:
     st.subheader("WV Estimate/Report of Production")
-    st.markdown(f'<div class="result-box">Brewer: <b>{BREWER_NAME}</b> &nbsp;|&nbsp; '
-                f'License #: <b>{LICENSE_NUMBER}</b></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="result-box">Brewer: <b>{BREWER_NAME}</b></div>', unsafe_allow_html=True)
+    license_no = st.text_input("WV brewer license #", value=st.session_state.license_no, key="license_input")
+    st.session_state.license_no = license_no
     st.caption("Channel is read from the product category: 1 = WV distributors, 2 = self-distribute, "
                "3/4 = other states. Keg deposits (6), tap handles (7) and services are ignored. "
                "Barrels are 31 gallons.")
@@ -451,7 +454,7 @@ with tab_eop:
         bc = v["by_channel"]
         wv_g, wv_b = bc["wv_dist"]
         self_g, self_b = bc["self"]
-        bp_g, bp_b = bc["brewpub"]
+        bp_data_g, bp_data_b = bc["brewpub"]   # from data (usually 0)
         other_g, other_b = bc["other_state"]
 
         st.markdown(
@@ -467,13 +470,25 @@ with tab_eop:
         with st.expander("Category audit (every category and where it landed)", expanded=v["has_unclassified"]):
             st.dataframe(v["cat_table"], use_container_width=True, hide_index=True)
 
+        # Brewpub (Q10/Q11): entered in BARRELS, converts to gallons, rolls into the total
+        bp_b_final = st.number_input(
+            "Brewpub sales (barrels) — Q10/Q11, manual entry",
+            min_value=0.0, value=float(bp_data_b), step=1.0, key="bp_bbl",
+            help="No brewpub category exists in the sales data, so enter it here. "
+                 "It converts to gallons and is added to the totals below.")
+        bp_g_final = round(bp_b_final * GAL_PER_BBL, 2)
+
+        # Total = data total, minus any data-brewpub, plus the manual brewpub
+        total_b_final = round(v["total_b"] - bp_data_b + bp_b_final, 4)
+        total_g_final = round(v["total_g"] - bp_data_g + bp_g_final, 2)
+
         st.markdown("**Channel breakdown:**")
         breakdown = pd.DataFrame([
             {"Channel": "Sold to WV distributors", "Gallons": wv_g, "Barrels": wv_b},
             {"Channel": "Self-distributed",        "Gallons": self_g, "Barrels": self_b},
-            {"Channel": "Brewpub",                 "Gallons": bp_g, "Barrels": bp_b},
+            {"Channel": "Brewpub (manual)",        "Gallons": bp_g_final, "Barrels": bp_b_final},
             {"Channel": "Other state (total only)","Gallons": other_g, "Barrels": other_b},
-            {"Channel": "TOTAL beer sales",        "Gallons": v["total_g"], "Barrels": v["total_b"]},
+            {"Channel": "TOTAL beer sales",        "Gallons": total_g_final, "Barrels": total_b_final},
         ])
         st.dataframe(breakdown, use_container_width=True, hide_index=True)
 
@@ -482,16 +497,11 @@ with tab_eop:
         cga, cgb = st.columns(2)
         with cga:
             q1_gal = st.number_input("Q1 — Est. gallons produced this year",
-                min_value=0.0, value=float(v["total_g"]), step=100.0, key="q1",
-                help="Prefilled with total sales gallons as a starting point. Adjust to your production estimate.")
+                min_value=0.0, value=float(total_g_final), step=100.0, key="q1",
+                help="Prefilled with total sales gallons (incl. brewpub) as a starting point. Adjust to your production estimate.")
         with cgb:
             q4_gal = st.number_input("Q4 — Prior year total production (gallons)",
                 min_value=0.0, value=0.0, step=100.0, key="q4")
-        bp_override = st.number_input(
-            "Q10 — Brewpub sales (gallons) — manual; no brewpub category in the data",
-            min_value=0.0, value=float(bp_g), step=10.0, key="bp")
-        bp_g_final = bp_override
-        bp_b_final = round(bp_override / GAL_PER_BBL, 4)
         q2_bbl = round(q1_gal / GAL_PER_BBL, 2)
         st.markdown(
             f'<div class="result-box">'
@@ -502,8 +512,9 @@ with tab_eop:
         values = {
             "fiscal_year": fy or f"{v['period_start']:%Y}-{v['period_end']:%Y}",
             "period_start": v["period_start"], "period_end": v["period_end"],
+            "brewer": BREWER_NAME, "license": license_no,
             "q1_gal": q1_gal, "q2_bbl": q2_bbl, "q3_bbl": FACILITY_CAPACITY_BBL, "q4_gal": q4_gal,
-            "total_g": v["total_g"], "total_b": v["total_b"],
+            "total_g": total_g_final, "total_b": total_b_final,
             "self_g": self_g, "self_b": self_b,
             "dist_g": wv_g, "dist_b": wv_b,
             "bp_g": bp_g_final, "bp_b": bp_b_final,
@@ -518,7 +529,7 @@ with tab_eop:
 
         new_row = {
             "Fiscal Year": values["fiscal_year"],
-            "Total Sales (gallons)": v["total_g"], "Total Sales (barrels)": v["total_b"],
+            "Total Sales (gallons)": total_g_final, "Total Sales (barrels)": total_b_final,
             "WV Distributor (gallons)": wv_g, "Self-distributed (gallons)": self_g,
             "Brewpub (gallons)": bp_g_final, "Other State (gallons)": other_g,
             "Generated": datetime.now().strftime("%Y-%m-%d"),
