@@ -112,6 +112,26 @@ def gas_upsert_history(new_row):
     rows = d.get("rows", [])
     return pd.DataFrame(rows, columns=HIST_HEADERS) if rows else pd.DataFrame(columns=HIST_HEADERS)
 
+def gas_ping():
+    """Return a human-readable diagnosis of the web-app connection."""
+    url, token = _gas_cfg()
+    if not url or not token:
+        return "No URL/token found in Streamlit secrets (need [gas] url and token)."
+    try:
+        body = _json.dumps({"action": "get_license", "token": token})
+        r = requests.post(url, data=body, headers={"Content-Type": "application/json"}, timeout=20)
+        try:
+            d = r.json()
+            if d.get("ok"):
+                return f"HTTP {r.status_code} — OK. Connection works."
+            return f"HTTP {r.status_code} — reached the script but it returned error='{d.get('error')}' (usually a token mismatch)."
+        except Exception:
+            snippet = " ".join(r.text.split())[:180]
+            return (f"HTTP {r.status_code} — response was not JSON. Usually means the deployment's access "
+                    f"isn't set to 'Anyone', or the URL isn't the /exec deployment URL. Begins: {snippet}")
+    except Exception as e:
+        return f"Request failed: {e}"
+
 # ── Parsing / multipliers ───────────────────────────────────────────────────────
 def get_multiplier(text):
     s = str(text).lower().replace(" ", "")
@@ -390,8 +410,11 @@ with tab_eop:
             st.toast("License number saved to the sheet")
 
     if sheets_ok:
-        st.markdown('<div class="template-saved">✓ Connected to the sheet — license & history save '
-                    'automatically.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="template-saved">✓ Sheet credentials loaded — use "Test connection" below '
+                    'to confirm read/write actually works.</div>', unsafe_allow_html=True)
+        with st.expander("Test connection"):
+            if st.button("Run connection test", key="gas_ping_btn"):
+                st.code(gas_ping())
     else:
         st.markdown('<div class="error-box">Sheet not connected yet — using the built-in license default '
                     'and the file fallback for history. Add the web-app URL + token to Streamlit secrets to '
