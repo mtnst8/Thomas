@@ -441,6 +441,7 @@ with tab_eop:
             help="No brewpub category exists in the sales data, so enter it here. It converts to gallons "
                  "and is added to the totals below.")
         bp_g_final = round(bp_b_final * GAL_PER_BBL, 2)
+        st.caption(f"= {bp_g_final:,.2f} gallons — added to the total below.")
         total_b_final = round(v["total_b"] - bp_data_b + bp_b_final, 4)
         total_g_final = round(v["total_g"] - bp_data_g + bp_g_final, 2)
 
@@ -455,17 +456,22 @@ with tab_eop:
         st.dataframe(breakdown, use_container_width=True, hide_index=True)
 
         st.markdown("---")
-        st.markdown("**Production-side figures (you confirm these):**")
+        st.markdown("**Production-side figures:**")
         cga, cgb = st.columns(2)
         with cga:
-            q1_gal = st.number_input("Q1 — Est. gallons produced this year", min_value=0.0,
-                value=float(total_g_final), step=100.0, key="q1",
-                help="Prefilled with total sales gallons (incl. brewpub). Adjust to your production estimate.")
+            q1_override = st.number_input("Q1 — Est. gallons produced this year (0 = use total sales)",
+                min_value=0.0, value=0.0, step=100.0, key="q1_override",
+                help="Leave at 0 to use total sales (incl. brewpub), which updates live as you change "
+                     "the brewpub barrels. Type a number to override with your own estimate.")
         with cgb:
             q4_gal = st.number_input("Q4 — Prior year total production (gallons)",
                 min_value=0.0, value=0.0, step=100.0, key="q4")
+        q1_gal = q1_override if q1_override > 0 else total_g_final
         q2_bbl = round(q1_gal / GAL_PER_BBL, 2)
-        st.markdown(f'<div class="result-box">Q2 — Est. barrels produced (Q1 ÷ 31): <b>{q2_bbl}</b> bbl<br>'
+        q1_note = "" if q1_override > 0 else " (= total sales, auto)"
+        st.markdown(f'<div class="result-box">'
+                    f'Q1 — Est. gallons produced: <b>{q1_gal:,.2f}</b> gal{q1_note}<br>'
+                    f'Q2 — Est. barrels produced (Q1 ÷ 31): <b>{q2_bbl}</b> bbl<br>'
                     f'Q3 — Production capacity (constant): <b>{FACILITY_CAPACITY_BBL:,}</b> bbl '
                     f'({FACILITY_CAPACITY_BBL * GAL_PER_BBL:,} gal)</div>', unsafe_allow_html=True)
 
