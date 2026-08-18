@@ -210,8 +210,17 @@ CHANNEL_LABEL = {
     "exclude": "Excluded (deposits/merch/services)", "unclassified": "UNCLASSIFIED - please review",
 }
 
+def _is_csv(f):
+    return str(getattr(f, "name", "")).lower().endswith(".csv")
+
+def _read_grid(uploaded_file, skiprows=0):
+    uploaded_file.seek(0)
+    if _is_csv(uploaded_file):
+        return pd.read_csv(uploaded_file, header=None, skiprows=skiprows, dtype=object)
+    return pd.read_excel(uploaded_file, header=None, skiprows=skiprows)
+
 def detect_header_row(uploaded_file):
-    raw = pd.read_excel(uploaded_file, header=None)
+    raw = _read_grid(uploaded_file)
     for i, row in raw.iterrows():
         vals = [str(v).lower() for v in row.values]
         if any("transaction date" in v or "quantity" in v for v in vals):
@@ -228,8 +237,7 @@ def load_template_bytes(override_file=None):
 def parse_sales_file(uploaded_file):
     uploaded_file.seek(0)
     header_row = detect_header_row(uploaded_file)
-    uploaded_file.seek(0)
-    raw_data = pd.read_excel(uploaded_file, header=None, skiprows=header_row + 1)
+    raw_data = _read_grid(uploaded_file, skiprows=header_row + 1)
     num_cols = raw_data.shape[1]
 
     if num_cols >= 10:
@@ -277,6 +285,14 @@ def parse_sales_file(uploaded_file):
 
 def process_file(uploaded_file, template_bytes):
     df, product_col = parse_sales_file(uploaded_file)
+    # One-month guard: a monthly file must contain a single calendar month.
+    months = sorted(df["Trans_Date"].dt.to_period("M").dropna().unique())
+    if not months:
+        raise ValueError("No dated transactions found in this file.")
+    if len(months) > 1:
+        names = ", ".join(p.to_timestamp().strftime("%b %Y") for p in months)
+        raise ValueError(f"File spans multiple months ({names}). Upload one month per file.")
+    month_label = months[0].to_timestamp().strftime("%b %Y")   # e.g. "Jun 2026"
     df = df[df["Channel"] != "exclude"]   # keg deposits / tap handles / services aren't taxable beer
     unmapped = [c for c in df[df["ABCA_Final"].isna()]["Customer_filled"].unique().tolist()
                 if pd.notna(c) and str(c).strip().lower() != "nan"]
@@ -291,7 +307,7 @@ def process_file(uploaded_file, template_bytes):
         ws.cell(row=i, column=5, value=round(row.BBL, 4))
         ws.cell(row=i, column=5).number_format = "0.0000"
     out = io.BytesIO(); wb.save(out); out.seek(0)
-    return out.read(), len(df), round(df["BBL"].sum(), 4), unmapped
+    return out.read(), len(df), round(df["BBL"].sum(), 4), unmapped, month_label
 
 def make_zip(results):
     buf = io.BytesIO()
@@ -388,8 +404,8 @@ with tab_tax:
 
     st.markdown("---")
     st.subheader("2. Upload Monthly Sales File(s)")
-    sales_files = st.file_uploader("Upload one or more monthly sales exports (e.g. Nov_25.xlsx)",
-                                   type=["xlsx"], accept_multiple_files=True, key="sales")
+    sales_files = st.file_uploader("Upload one or more monthly sales exports (.xlsx or .csv)",
+                                   type=["xlsx", "csv"], accept_multiple_files=True, key="sales")
 
     st.markdown("---")
     with st.expander("⚙️ Manage Distributor ABCA Numbers"):
@@ -412,15 +428,15 @@ with tab_tax:
     if st.button("▶ Process Files", disabled=(not template_bytes or not sales_files)):
         st.session_state.results = []
         for sf in sales_files:
-            filename = sf.name.replace(".xlsx", "")
-            output_name = f"{filename}_Final.xlsx"
+            base = sf.name.rsplit(".", 1)[0]
             try:
                 sf.seek(0)
-                rb, rc, tb, um = process_file(sf, template_bytes)
-                st.session_state.results.append({"filename": filename, "output_name": output_name,
+                rb, rc, tb, um, mlabel = process_file(sf, template_bytes)
+                output_name = f"{mlabel} WV BBL Tax.xlsx"
+                st.session_state.results.append({"filename": base, "output_name": output_name,
                     "result_bytes": rb, "row_count": rc, "total_bbl": tb, "unmapped": um, "error": None})
             except Exception as e:
-                st.session_state.results.append({"filename": filename, "output_name": output_name,
+                st.session_state.results.append({"filename": base, "output_name": f"{base}_Final.xlsx",
                     "unmapped": [], "error": str(e)})
 
     if st.session_state.results:
@@ -471,7 +487,7 @@ with tab_eop:
                "Barrels are 31 gallons.")
 
     fy = st.text_input("Fiscal year label", value="", placeholder="e.g. 2025-2026", key="fy")
-    year_file = st.file_uploader("Upload the year's sales export (raw dump .xlsx)", type=["xlsx"], key="year_file")
+    year_file = st.file_uploader("Upload the year's sales export (raw dump .xlsx or .csv)", type=["xlsx", "csv"], key="year_file")
     prior_history = None
     if not sheets_ok:
         prior_history = st.file_uploader(
