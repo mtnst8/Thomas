@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import requests
 import json as _json
+import base64
 from openpyxl import load_workbook, Workbook
 import io
 import zipfile
@@ -133,6 +134,16 @@ def gas_upsert_history(new_row):
         return None
     rows = d.get("rows", [])
     return pd.DataFrame(rows, columns=HIST_HEADERS) if rows else pd.DataFrame(columns=HIST_HEADERS)
+
+@st.cache_data(show_spinner=False)
+def gas_get_template_bytes():
+    d = _gas_post({"action": "get_template"})
+    if not d or not d.get("b64"):
+        return None
+    try:
+        return base64.b64decode(d["b64"])
+    except Exception:
+        return None
 
 def gas_ping():
     """Return a human-readable diagnosis of the web-app connection."""
@@ -350,23 +361,24 @@ tab_tax, tab_eop = st.tabs(["Monthly BBL Tax Report", "Production Estimate/Repor
 # ════════════════════════════════════════════════════════════════════════════════
 with tab_tax:
     st.subheader("1. WV Upload Template")
-    if TEMPLATE_PATH and TEMPLATE_PATH.exists():
+    repo_ok = bool(TEMPLATE_PATH and TEMPLATE_PATH.exists())
+    drive_tpl = gas_get_template_bytes() if (sheets_ok and not repo_ok) else None
+    if repo_ok:
         st.markdown(f'<div class="template-saved">✓ Template loaded from repo — '
                     f'<em>{TEMPLATE_PATH.name}</em></div>', unsafe_allow_html=True)
         override = st.file_uploader("Override template for this session only (optional)",
                                     type=["xlsx"], key="template_override")
+    elif drive_tpl:
+        st.markdown('<div class="template-saved">✓ Template loaded from your Drive via the web app — '
+                    'nothing to commit or upload.</div>', unsafe_allow_html=True)
+        override = st.file_uploader("Override template for this session only (optional)",
+                                    type=["xlsx"], key="template_override")
     else:
-        try:
-            seen = sorted({p.name for p in Path(__file__).resolve().parent.rglob("*.xlsx")})[:12]
-        except Exception:
-            seen = []
-        seen_txt = ("<br>.xlsx files the app can see: " + ", ".join(seen)) if seen \
-                   else "<br>(No .xlsx files found next to app.py — it likely wasn't committed.)"
-        st.markdown('<div class="error-box">⚠️ No template found. Commit '
-                    '<em>__WV_Upload_Template.xlsx</em> to the same folder as app.py, or upload one below.'
-                    f'{seen_txt}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="error-box">⚠️ No template found in the repo or via the web app. '
+                    'Upload one below for this session (and see the note about redeploying the script).</div>',
+                    unsafe_allow_html=True)
         override = st.file_uploader("Upload __WV_Upload_Template.xlsx", type=["xlsx"], key="template_override")
-    template_bytes = load_template_bytes(override)
+    template_bytes = override.getvalue() if override else (TEMPLATE_PATH.read_bytes() if repo_ok else drive_tpl)
 
     st.markdown("---")
     st.subheader("2. Upload Monthly Sales File(s)")
