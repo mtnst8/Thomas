@@ -284,28 +284,38 @@ def parse_sales_file(uploaded_file):
     return df, product_col
 
 def _net_rows(df):
-    """Build the output rows. A distributor that has any negative (return) line is
-    collapsed to ONE net line (latest invoice date + that invoice #); distributors
-    with no returns keep their individual invoice lines. Returns (rows, net_negative)
-    where net_negative lists distributors whose month total is below zero."""
+    """Keep every invoice line listed. For a distributor with returns (negative
+    lines), remove the negative lines and subtract their total from that
+    distributor's positive invoices (largest first, so no line goes negative) —
+    the invoice list stays intact, just with adjusted barrels. net_negative lists
+    distributors whose returns exceed all their sales for the month."""
     rows, net_negative = [], []
     d = df.copy()
-    # Unmapped rows (no ABCA) pass through untouched — they get flagged separately.
-    for r in d[d["ABCA_Final"].isna()].itertuples(index=False):
-        rows.append((r.Trans_Date, r.Num, r.ABCA_Final, r.Licensee, round(r.BBL, 4)))
+    for r in d[d["ABCA_Final"].isna()].itertuples(index=False):   # unmapped pass-through
+        rows.append([r.Trans_Date, r.Num, r.ABCA_Final, r.Licensee, round(r.BBL, 4)])
     mapped = d[d["ABCA_Final"].notna()]
     for _, g in mapped.groupby("ABCA_Final", sort=False):
-        if (g["BBL"] < 0).any():
-            net = round(g["BBL"].sum(), 4)
-            latest = g.loc[g["Trans_Date"].idxmax()]
-            rows.append((latest["Trans_Date"], latest["Num"], latest["ABCA_Final"],
-                         latest["Licensee"], net))
-            if net < 0:
-                net_negative.append(str(latest["Licensee"]))
-        else:
-            for r in g.itertuples(index=False):
-                rows.append((r.Trans_Date, r.Num, r.ABCA_Final, r.Licensee, round(r.BBL, 4)))
-    rows.sort(key=lambda x: (pd.isna(x[0]), x[0]))   # chronological
+        neg_total = g.loc[g["BBL"] < 0, "BBL"].sum()   # <= 0
+        if neg_total >= 0:
+            for r in g.itertuples(index=False):        # no returns → keep every line as-is
+                rows.append([r.Trans_Date, r.Num, r.ABCA_Final, r.Licensee, round(r.BBL, 4)])
+            continue
+        deficit = -neg_total                           # amount to remove from positives
+        pos = g[g["BBL"] > 0]
+        adj = {idx: float(v) for idx, v in pos["BBL"].items()}
+        for idx in pos.sort_values("BBL", ascending=False).index:   # largest first
+            if deficit <= 1e-9:
+                break
+            take = min(adj[idx], deficit)
+            adj[idx] = round(adj[idx] - take, 4)
+            deficit = round(deficit - take, 4)
+        for r in pos.sort_values("Trans_Date").itertuples():        # keep positive lines, listed
+            rows.append([r.Trans_Date, r.Num, r.ABCA_Final, r.Licensee, round(adj[r.Index], 4)])
+        if deficit > 1e-9:                             # returns exceeded all sales → unavoidable negative
+            last = g.sort_values("Trans_Date").iloc[-1]
+            rows.append([last["Trans_Date"], last["Num"], last["ABCA_Final"], last["Licensee"], round(-deficit, 4)])
+            net_negative.append(str(g["Licensee"].iloc[0]))
+    rows.sort(key=lambda x: (pd.isna(x[0]), x[0]))     # chronological
     return rows, net_negative
 
 def process_file(uploaded_file, template_bytes):
