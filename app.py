@@ -283,6 +283,31 @@ def parse_sales_file(uploaded_file):
     df["Licensee"] = df["norm"].map(lambda x: st.session_state.abca_map.get(x, (None, None))[1])
     return df, product_col
 
+def _net_rows(df):
+    """Build the output rows. A distributor that has any negative (return) line is
+    collapsed to ONE net line (latest invoice date + that invoice #); distributors
+    with no returns keep their individual invoice lines. Returns (rows, net_negative)
+    where net_negative lists distributors whose month total is below zero."""
+    rows, net_negative = [], []
+    d = df.copy()
+    # Unmapped rows (no ABCA) pass through untouched — they get flagged separately.
+    for r in d[d["ABCA_Final"].isna()].itertuples(index=False):
+        rows.append((r.Trans_Date, r.Num, r.ABCA_Final, r.Licensee, round(r.BBL, 4)))
+    mapped = d[d["ABCA_Final"].notna()]
+    for _, g in mapped.groupby("ABCA_Final", sort=False):
+        if (g["BBL"] < 0).any():
+            net = round(g["BBL"].sum(), 4)
+            latest = g.loc[g["Trans_Date"].idxmax()]
+            rows.append((latest["Trans_Date"], latest["Num"], latest["ABCA_Final"],
+                         latest["Licensee"], net))
+            if net < 0:
+                net_negative.append(str(latest["Licensee"]))
+        else:
+            for r in g.itertuples(index=False):
+                rows.append((r.Trans_Date, r.Num, r.ABCA_Final, r.Licensee, round(r.BBL, 4)))
+    rows.sort(key=lambda x: (pd.isna(x[0]), x[0]))   # chronological
+    return rows, net_negative
+
 def process_file(uploaded_file, template_bytes):
     df, product_col = parse_sales_file(uploaded_file)
     # One-month guard: a monthly file must contain a single calendar month.
@@ -296,18 +321,20 @@ def process_file(uploaded_file, template_bytes):
     df = df[df["Channel"] != "exclude"]   # keg deposits / tap handles / services aren't taxable beer
     unmapped = [c for c in df[df["ABCA_Final"].isna()]["Customer_filled"].unique().tolist()
                 if pd.notna(c) and str(c).strip().lower() != "nan"]
+    rows, net_negative = _net_rows(df)
     wb = load_workbook(io.BytesIO(template_bytes))
     ws = wb["Section_2"]
-    for i, row in enumerate(df.itertuples(index=False), 6):
-        ws.cell(row=i, column=1, value=row.Trans_Date.date())
+    for i, (dt, num, abca, lic, bbl) in enumerate(rows, 6):
+        ws.cell(row=i, column=1, value=dt.date() if pd.notna(dt) else None)
         ws.cell(row=i, column=1).number_format = "MM/DD/YYYY"
-        ws.cell(row=i, column=2, value=row.Num)
-        ws.cell(row=i, column=3, value=row.ABCA_Final)
-        ws.cell(row=i, column=4, value=row.Licensee)
-        ws.cell(row=i, column=5, value=round(row.BBL, 4))
+        ws.cell(row=i, column=2, value=num)
+        ws.cell(row=i, column=3, value=abca)
+        ws.cell(row=i, column=4, value=lic)
+        ws.cell(row=i, column=5, value=bbl)
         ws.cell(row=i, column=5).number_format = "0.0000"
     out = io.BytesIO(); wb.save(out); out.seek(0)
-    return out.read(), len(df), round(df["BBL"].sum(), 4), unmapped, month_label
+    total_bbl = round(sum(b for *_, b in rows if pd.notna(b)), 4)
+    return out.read(), len(rows), total_bbl, unmapped, month_label, net_negative
 
 def make_zip(results):
     buf = io.BytesIO()
@@ -431,10 +458,11 @@ with tab_tax:
             base = sf.name.rsplit(".", 1)[0]
             try:
                 sf.seek(0)
-                rb, rc, tb, um, mlabel = process_file(sf, template_bytes)
+                rb, rc, tb, um, mlabel, netneg = process_file(sf, template_bytes)
                 output_name = f"{mlabel} WV BBL Tax.xlsx"
                 st.session_state.results.append({"filename": base, "output_name": output_name,
-                    "result_bytes": rb, "row_count": rc, "total_bbl": tb, "unmapped": um, "error": None})
+                    "result_bytes": rb, "row_count": rc, "total_bbl": tb, "unmapped": um,
+                    "net_negative": netneg, "error": None})
             except Exception as e:
                 st.session_state.results.append({"filename": base, "output_name": f"{base}_Final.xlsx",
                     "unmapped": [], "error": str(e)})
@@ -453,6 +481,10 @@ with tab_tax:
                 st.markdown(f'<div class="error-box">⚠️ <b>{r["filename"]}</b> — {len(u)} unmapped: {", ".join(str(x) for x in u)}<br>Add them in the ABCA manager above and re-run.</div>', unsafe_allow_html=True)
             else:
                 st.markdown(f'<div class="result-box">✓ <b>{r["output_name"]}</b> — {r["row_count"]} rows &nbsp;|&nbsp; {r["total_bbl"]} BBL total</div>', unsafe_allow_html=True)
+                if r.get("net_negative"):
+                    st.markdown(f'<div class="error-box">⚠️ Net-negative this month: {", ".join(r["net_negative"])}. '
+                                'The state can\'t accept a negative line — carry that credit to another month or adjust it manually before uploading.</div>',
+                                unsafe_allow_html=True)
                 st.download_button(f"⬇ Download {r['output_name']}", data=r["result_bytes"], file_name=r["output_name"],
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"dl_{r['filename']}")
     elif not template_bytes or not sales_files:
