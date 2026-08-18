@@ -67,6 +67,13 @@ def _locate_template():
 
 _tpl = _locate_template()
 TEMPLATE_PATH = Path(_tpl) if _tpl else None
+
+# Template baked into the app (text module, commits reliably; no Drive/web-app needed).
+try:
+    from template_b64 import TEMPLATE_B64
+    EMBEDDED_TEMPLATE = base64.b64decode(TEMPLATE_B64)
+except Exception:
+    EMBEDDED_TEMPLATE = None
 HIST_HEADERS = ["Fiscal Year", "Total Sales (gallons)", "Total Sales (barrels)",
                 "WV Distributor (gallons)", "Self-distributed (gallons)",
                 "Brewpub (gallons)", "Other State (gallons)", "Generated"]
@@ -362,23 +369,22 @@ tab_tax, tab_eop = st.tabs(["Monthly BBL Tax Report", "Production Estimate/Repor
 with tab_tax:
     st.subheader("1. WV Upload Template")
     repo_ok = bool(TEMPLATE_PATH and TEMPLATE_PATH.exists())
-    drive_tpl = gas_get_template_bytes() if (sheets_ok and not repo_ok) else None
     if repo_ok:
-        st.markdown(f'<div class="template-saved">✓ Template loaded from repo — '
-                    f'<em>{TEMPLATE_PATH.name}</em></div>', unsafe_allow_html=True)
-        override = st.file_uploader("Override template for this session only (optional)",
-                                    type=["xlsx"], key="template_override")
-    elif drive_tpl:
-        st.markdown('<div class="template-saved">✓ Template loaded from your Drive via the web app — '
-                    'nothing to commit or upload.</div>', unsafe_allow_html=True)
+        source, label = TEMPLATE_PATH.read_bytes(), f"repo — {TEMPLATE_PATH.name}"
+    elif EMBEDDED_TEMPLATE:
+        source, label = EMBEDDED_TEMPLATE, "built into the app"
+    else:
+        source, label = None, None
+    if source is not None:
+        st.markdown(f'<div class="template-saved">✓ Template loaded ({label}) — '
+                    'nothing to upload.</div>', unsafe_allow_html=True)
         override = st.file_uploader("Override template for this session only (optional)",
                                     type=["xlsx"], key="template_override")
     else:
-        st.markdown('<div class="error-box">⚠️ No template found in the repo or via the web app. '
-                    'Upload one below for this session (and see the note about redeploying the script).</div>',
-                    unsafe_allow_html=True)
+        st.markdown('<div class="error-box">⚠️ No template available yet — upload one below for this '
+                    'session.</div>', unsafe_allow_html=True)
         override = st.file_uploader("Upload __WV_Upload_Template.xlsx", type=["xlsx"], key="template_override")
-    template_bytes = override.getvalue() if override else (TEMPLATE_PATH.read_bytes() if repo_ok else drive_tpl)
+    template_bytes = override.getvalue() if override else source
 
     st.markdown("---")
     st.subheader("2. Upload Monthly Sales File(s)")
